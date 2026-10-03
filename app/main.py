@@ -18,6 +18,9 @@ from app.schemas import (
     ExposureOut,
     LayerCreate,
     LayerOut,
+    RearrangeIn,
+    RearrangeOut,
+    RearrangeResult,
     UnassignedOut,
 )
 
@@ -109,6 +112,26 @@ def update_experiment(
 @app.post("/experiments/{experiment_id}/end", response_model=ExperimentOut)
 def end_experiment(experiment_id: UUID, db: Session = Depends(get_db)):
     return service.end_experiment(db, experiment_id)
+
+
+@app.post("/layers/{layer_id}/rearrangements", response_model=RearrangeOut)
+def rearrange_layer(layer_id: UUID, payload: RearrangeIn, db: Session = Depends(get_db)):
+    """Atomically re-bucket many experiments of one layer in one batch."""
+    results = service.rearrange_layer(db, layer_id, payload.items)
+    return RearrangeOut(
+        layer_id=layer_id,
+        experiments=[
+            RearrangeResult(
+                id=exp.id,
+                status=exp.status,
+                version=exp.version,
+                bucket_start=exp.bucket_start,
+                bucket_end=exp.bucket_end,
+                changed=changed,
+            )
+            for exp, changed in results
+        ],
+    )
 
 
 # ------------------------------------------------------------- assignments

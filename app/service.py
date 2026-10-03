@@ -7,19 +7,39 @@ Locking / isolation protocol (PostgreSQL, READ COMMITTED):
     against ACTIVE experiments inside the same transaction. Two concurrent
     publishes therefore cannot both pass validation.
 
-  * assign: take the experiment row lock FOR SHARE (read=True). FOR SHARE is
-    compatible with other concurrent assigns but blocks a concurrent END
-    (which takes FOR UPDATE on the same row) until this transaction commits,
-    so an experiment cannot be ended in the middle of an assignment. The
-    partial unique index uq_assignments_active_user guarantees at most one
-    ACTIVE assignment per (layer, user); on a unique-violation race the loser
-    re-reads and returns the winner's assignment.
+  * rearrange (batch): take the LAYER row lock FOR UPDATE (serializing with
+    publish/update/rearrange of the layer), then lock every listed experiment
+    row FOR UPDATE in experiment-id order (consistent order => no deadlock)
+    and re-read status/version. Only then does it check the whole resulting
+    layout for overlap (listed-vs-listed, including swaps, and against
+    unlisted ACTIVE experiments). Ranges are all written and committed in one
+    transaction, so any single failure rolls back the entire batch. Because
+    assign takes only FOR SHARE on the experiment row it blocks until the
+    committed new layout is visible and never assigns under a stale range.
 
-  * end: take the experiment row lock FOR UPDATE (waits for in-flight
-    assigns), mark ended, then close all its active assignments in the same
-    transaction. After commit no ACTIVE assignment can exist for the
-    experiment, and no new one can be created (assign re-checks status under
-    the lock).
+  * assign: take the LAYER row lock FOR SHARE first and only then the
+    experiment row lock FOR SHARE (read=True). Establishing the global order
+    "layer -> experiment" matters because inserting an assignment also takes
+    FOR KEY SHARE on the referenced layer/experiment rows; without the early
+    layer lock, assign would hold an experiment lock while blocking on the
+    layer row held FOR UPDATE by a concurrent publish/rearrange (a deadlock
+    cycle). FOR SHARE is compatible with other concurrent assigns but blocks
+    a concurrent writer (publish/update/rearrange/END): the writer waits at
+    the layer row until in-flight assigns commit, and assigns starting while
+    a writer holds the layer FOR UPDATE wait until the new layout is
+    committed, so they never read or assign under a half-switched layout.
+    The partial unique index uq_assignments_active_user guarantees at most
+    one ACTIVE assignment per (layer, user); on a unique-violation race the
+    loser re-reads and returns the winner's assignment.
+
+  * end: take the LAYER row lock FOR SHARE first, then the experiment row
+    FOR UPDATE (waits for in-flight assigns holding FOR SHARE on it), mark
+    ended, then close all its active assignments in the same transaction.
+    Taking the layer lock first keeps the global "layer -> experiment" order
+    (the assignment UPDATE touches the layer row via FK), so END cannot
+    deadlock against publish/rearrange the other way around. After commit no
+    ACTIVE assignment can exist for the experiment, and no new one can be
+    created (assign re-checks status under the lock).
 
   * exposure: lock the assignment row FOR UPDATE so a concurrent END either
     closes the assignment first (exposure then rejected) or waits until the
@@ -39,7 +59,7 @@ from sqlalchemy.orm import Session
 
 from app.hashing import choose_group, user_bucket
 from app.models import Assignment, Experiment, Exposure, Layer
-from app.schemas import ExperimentConfig, ExperimentCreate, ExperimentUpdate
+from app.schemas import ExperimentConfig, ExperimentCreate, ExperimentUpdate, RearrangeItem
 
 _MISSING = object()
 
@@ -171,6 +191,16 @@ def update_experiment(db: Session, experiment_id: UUID, patch: ExperimentUpdate)
 
     # Serialize with other publishers/updaters of the layer.
     db.execute(select(Layer).where(Layer.id == exp.layer_id).with_for_update())
+    # Re-read the row under the layer lock: an END may have committed just
+    # before we acquired it (every mutator takes the layer lock first).
+    exp = db.execute(
+        select(Experiment)
+        .where(Experiment.id == experiment_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    if exp.status == "ended":
+        raise HTTPException(409, "ended experiment cannot be modified")
     if exp.status == "active":
         _assert_no_overlap(db, exp.layer_id, exp.id, cfg.bucket_start, cfg.bucket_end)
 
@@ -189,15 +219,146 @@ def update_experiment(db: Session, experiment_id: UUID, patch: ExperimentUpdate)
     return exp
 
 
+def rearrange_layer(
+    db: Session, layer_id: UUID, items: list[RearrangeItem]
+) -> list[tuple[Experiment, bool]]:
+    """Atomically re-bucket many experiments of one layer in a single batch.
+
+    Allowed per item: move an ACTIVE experiment to a new (or the same)
+    half-open range, or publish a DRAFT at the given range. Ranges of two
+    listed experiments may be swapped freely.
+
+    Atomicity: every check below runs inside ONE transaction under the layer
+    row lock (same lock as publish/update, so a concurrent single-experiment
+    publish cannot interleave). Any failure rolls the whole batch back and
+    leaves the layout untouched.
+
+    Checks (in order):
+      * layer exists;
+      * every experiment exists, belongs to this layer and is not ended;
+      * every expected_version matches the stored version (drafts are 0);
+      * target ranges are legal (validated already at the schema layer);
+      * the resulting layout has no overlap: both among listed experiments
+        and against any ACTIVE experiment not listed in the batch.
+
+    On success an ACTIVE experiment whose range actually changes gets a
+    version bump (existing assignments keep their old snapshot/version; only
+    new users follow the new layout). A draft becomes ACTIVE with version 1.
+    Returns [(experiment, changed), ...] in request order.
+    """
+    get_layer(db, layer_id)
+
+    # 1. Serialize with publish/update/rearrange of the same layer.
+    db.execute(select(Layer).where(Layer.id == layer_id).with_for_update())
+
+    # 2. Lock every listed experiment row in id order, then re-read state.
+    #    FOR UPDATE waits for in-flight assigns (which hold FOR SHARE) and
+    #    serializes with END, so a concurrent end cannot win a row mid-batch.
+    target_by_id: dict[UUID, Experiment] = {}
+    for it in sorted(items, key=lambda x: str(x.experiment_id)):
+        row = db.execute(
+            select(Experiment)
+            .where(Experiment.id == it.experiment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(404, f"experiment {it.experiment_id} not found")
+        if row.layer_id != layer_id:
+            raise HTTPException(
+                409,
+                f"experiment {it.experiment_id} does not belong to layer {layer_id}",
+            )
+        if row.status == "ended":
+            raise HTTPException(409, f"experiment {it.experiment_id} has already ended")
+        if row.version != it.expected_version:
+            raise HTTPException(
+                409,
+                f"experiment {it.experiment_id} version conflict: "
+                f"expected {it.expected_version}, current {row.version}",
+            )
+        target_by_id[it.experiment_id] = row
+
+    # 3. Build the post-batch layout of listed experiments and check that
+    #    their own target ranges do not overlap each other (this is what
+    #    permits swapping two existing ranges in one batch).
+    listed = [(it.experiment_id, it.bucket_start, it.bucket_end) for it in items]
+    for i, (id_i, si, ei) in enumerate(listed):
+        for id_j, sj, ej in listed[i + 1 :]:
+            if si < ej and sj < ei:
+                raise HTTPException(
+                    409,
+                    f"batch ranges overlap: experiment {id_i} [{si}, {ei}) "
+                    f"and experiment {id_j} [{sj}, {ej})",
+                )
+
+    # 4. Every listed range must stay clear of ACTIVE experiments that are
+    #    not part of the batch (ended/draft rows do not occupy buckets).
+    listed_ids = [it.experiment_id for it in items]
+    unlisted_active = db.execute(
+        select(Experiment).where(
+            Experiment.layer_id == layer_id,
+            Experiment.status == "active",
+            Experiment.id.notin_(listed_ids),
+        )
+    ).scalars().all()
+    for id_i, si, ei in listed:
+        for other in unlisted_active:
+            if other.bucket_start < ei and si < other.bucket_end:
+                raise HTTPException(
+                    409,
+                    f"bucket range [{si}, {ei}) of experiment {id_i} overlaps "
+                    f"active experiment {other.id} "
+                    f"[{other.bucket_start}, {other.bucket_end}) not in the batch",
+                )
+
+    # 5. All checks passed: apply the whole batch, then commit together.
+    results: list[tuple[Experiment, bool]] = []
+    now = datetime.now(timezone.utc)
+    for it in items:
+        exp = target_by_id[it.experiment_id]
+        if exp.status == "draft":
+            # Publishing a draft is a change even if the stored range equals
+            # the requested one (it starts serving new users).
+            exp.status = "active"
+            exp.published_at = now
+            exp.bucket_start = it.bucket_start
+            exp.bucket_end = it.bucket_end
+            exp.version += 1  # draft (0) -> first published version (1)
+            changed = True
+        else:
+            moved = exp.bucket_start != it.bucket_start or exp.bucket_end != it.bucket_end
+            exp.bucket_start = it.bucket_start
+            exp.bucket_end = it.bucket_end
+            if moved:
+                exp.version += 1
+            changed = moved
+        results.append((exp, changed))
+
+    db.commit()
+    for exp, _ in results:
+        db.refresh(exp)
+    return results
+
+
 def end_experiment(db: Session, experiment_id: UUID) -> Experiment:
+    exp = db.get(Experiment, experiment_id)
+    if exp is None:
+        raise HTTPException(404, "experiment not found")
+    # 1. Take the layer row first so the global lock order is always
+    #    "layer -> experiment" (see module docstring); FOR SHARE is enough
+    #    for a status transition and serializes with in-flight assigns.
+    db.execute(
+        select(Layer).where(Layer.id == exp.layer_id).with_for_update(read=True)
+    )
+    # 2. Lock the experiment row (waits for in-flight assigns' FOR SHARE) and
+    #    re-read its status under the layer lock.
     exp = db.execute(
         select(Experiment)
         .where(Experiment.id == experiment_id)
-        .with_for_update()  # waits for in-flight assigns (FOR SHARE)
+        .with_for_update()
         .execution_options(populate_existing=True)
-    ).scalar_one_or_none()
-    if exp is None:
-        raise HTTPException(404, "experiment not found")
+    ).scalar_one()
     if exp.status == "draft":
         raise HTTPException(409, "experiment is not published")
     if exp.status == "ended":
@@ -239,6 +400,14 @@ def assign(
     """Returns (assignment_or_None, bucket, unassigned_reason_or_None)."""
     layer = get_layer(db, layer_id)
     bucket = user_bucket(layer.salt, user_key)
+
+    # 1a. Take the layer row FOR SHARE before any experiment-row lock, so the
+    #     global lock order is always "layer -> experiment" (see module
+    #     docstring). Blocks behind publish/update/rearrange (FOR UPDATE)
+    #     until their new layout is committed.
+    db.execute(
+        select(Layer.id).where(Layer.id == layer.id).with_for_update(read=True)
+    )
 
     # 1. A valid (active) assignment for this user in this layer persists.
     existing = _active_assignment(db, layer.id, user_key)

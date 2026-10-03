@@ -65,6 +65,60 @@ class ExperimentUpdate(BaseModel):
     groups: list[GroupSpec] | None = Field(default=None, min_length=1)
 
 
+# ---------- batch rearrangement (many experiments, one layer, one tx) ----
+
+class RearrangeItem(BaseModel):
+    """One experiment move inside the layer's batch rearrangement.
+
+    expected_version is an optimistic-concurrency token: it must equal the
+    experiment's current version (drafts are version 0). Drafts listed here
+    are published as part of the batch; active experiments are moved to the
+    target half-open range. The range must lie within [0, 10000).
+    """
+
+    experiment_id: UUID
+    expected_version: int = Field(ge=0)
+    bucket_start: int = Field(ge=0, lt=TOTAL_BUCKETS)
+    bucket_end: int = Field(gt=0, le=TOTAL_BUCKETS)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "RearrangeItem":
+        if self.bucket_start >= self.bucket_end:
+            raise ValueError("bucket_start must be < bucket_end (half-open range)")
+        return self
+
+
+class RearrangeIn(BaseModel):
+    items: list[RearrangeItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_experiments(self) -> "RearrangeIn":
+        ids = [it.experiment_id for it in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("experiment_id must not repeat within the batch")
+        return self
+
+
+class RearrangeResult(BaseModel):
+    """One experiment's state after the batch."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    status: str
+    version: int
+    bucket_start: int
+    bucket_end: int
+    # True when this experiment's version was incremented by the batch:
+    # an active experiment whose range actually changed, or a draft published.
+    changed: bool
+
+
+class RearrangeOut(BaseModel):
+    layer_id: UUID
+    experiments: list[RearrangeResult]
+
+
 class ExperimentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
