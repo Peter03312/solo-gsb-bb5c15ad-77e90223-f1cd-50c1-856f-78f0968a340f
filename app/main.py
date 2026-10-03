@@ -2,7 +2,7 @@
 from contextlib import asynccontextmanager
 from uuid import UUID
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 
 from app import service
@@ -11,6 +11,8 @@ from app.models import Assignment
 from app.schemas import (
     AssignIn,
     AssignmentOut,
+    BatchReshuffleIn,
+    BatchReshuffleOut,
     ExperimentCreate,
     ExperimentOut,
     ExperimentUpdate,
@@ -18,6 +20,7 @@ from app.schemas import (
     ExposureOut,
     LayerCreate,
     LayerOut,
+    ReshuffleResultItem,
     UnassignedOut,
 )
 
@@ -109,6 +112,36 @@ def update_experiment(
 @app.post("/experiments/{experiment_id}/end", response_model=ExperimentOut)
 def end_experiment(experiment_id: UUID, db: Session = Depends(get_db)):
     return service.end_experiment(db, experiment_id)
+
+
+@app.post("/layers/{layer_id}/reshuffle", response_model=BatchReshuffleOut)
+def batch_reshuffle(layer_id: UUID, payload: BatchReshuffleIn, db: Session = Depends(get_db)):
+    if payload.layer_id != layer_id:
+        raise HTTPException(
+            422, "layer_id in path and body must match"
+        )
+    results = service.batch_reshuffle(db, layer_id, payload.items)
+    return BatchReshuffleOut(
+        layer_id=layer_id,
+        results=[
+            ReshuffleResultItem(
+                id=exp.id,
+                layer_id=exp.layer_id,
+                name=exp.name,
+                status=exp.status,
+                version=exp.version,
+                bucket_start=exp.bucket_start,
+                bucket_end=exp.bucket_end,
+                conditions=exp.conditions,
+                groups=exp.groups,
+                changed=changed,
+                created_at=exp.created_at,
+                published_at=exp.published_at,
+                ended_at=exp.ended_at,
+            )
+            for exp, changed in results
+        ],
+    )
 
 
 # ------------------------------------------------------------- assignments

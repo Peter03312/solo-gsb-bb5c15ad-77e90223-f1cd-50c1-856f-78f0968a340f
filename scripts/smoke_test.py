@@ -254,6 +254,182 @@ def main():
             break
     check("assign-vs-end race: no user left with a valid assignment of ended experiment", ok, detail)
 
+    # ---- batch reshuffle: validation ---------------------------------------
+    layer5 = make_layer("reshuffle")
+    l5 = layer5["id"]
+    j1 = make_experiment(l5, "J1", 0, 4000, groups=[{"name": "all", "weight": 10000}])
+    j2 = make_experiment(l5, "J2", 4000, 7000, groups=[{"name": "all", "weight": 10000}])
+    j3 = make_experiment(l5, "J3", 7000, 10000, groups=[{"name": "all", "weight": 10000}])
+    req("POST", f"/experiments/{j1['id']}/publish")
+    req("POST", f"/experiments/{j2['id']}/publish")
+
+    def reshuffle(items, layer=l5):
+        return req("POST", f"/layers/{layer}/reshuffle",
+                   {"layer_id": layer, "items": items})
+
+    s, r = reshuffle([{"experiment_id": j1["id"], "expected_version": 1,
+                       "bucket_start": 0, "bucket_end": 4000},
+                      {"experiment_id": j1["id"], "expected_version": 1,
+                       "bucket_start": 4000, "bucket_end": 7000}])
+    check("reshuffle: duplicate experiment in batch -> 422", s == 422, r)
+
+    s, r = reshuffle([{"experiment_id": j3["id"], "expected_version": 0,
+                       "bucket_start": 5000, "bucket_end": 5000}])
+    check("reshuffle: empty target range -> 422", s == 422, r)
+
+    s, r = reshuffle([{"experiment_id": j3["id"], "expected_version": 0,
+                       "bucket_start": 0, "bucket_end": 10001}])
+    check("reshuffle: out-of-bounds range -> 422", s == 422, r)
+
+    s, r = reshuffle([{"experiment_id": j3["id"], "expected_version": 0,
+                       "bucket_start": 3000, "bucket_end": 8000}])
+    check("reshuffle: overlap with unlisted active -> 409", s == 409, r)
+
+    s, r = reshuffle([{"experiment_id": j1["id"], "expected_version": 1,
+                       "bucket_start": 0, "bucket_end": 6000},
+                      {"experiment_id": j2["id"], "expected_version": 1,
+                       "bucket_start": 5000, "bucket_end": 9000}])
+    check("reshuffle: in-batch overlap -> 409", s == 409, r)
+
+    s, r = reshuffle([{"experiment_id": j1["id"], "expected_version": 99,
+                       "bucket_start": 0, "bucket_end": 4000}])
+    check("reshuffle: stale expected_version -> 409", s == 409, r)
+
+    s, r = reshuffle([{"experiment_id": str(uuid.uuid4()), "expected_version": 0,
+                       "bucket_start": 0, "bucket_end": 4000}])
+    check("reshuffle: unknown experiment -> 404", s == 404, r)
+
+    s, r = reshuffle([{"experiment_id": j1["id"], "expected_version": 1,
+                       "bucket_start": 0, "bucket_end": 4000}], layer=l2)
+    check("reshuffle: experiment from another layer -> 409", s == 409, r)
+
+    # failed batches must leave no partial change
+    got1 = req("GET", f"/experiments/{j1['id']}")[1]
+    got3 = req("GET", f"/experiments/{j3['id']}")[1]
+    check("failed reshuffle leaves state untouched",
+          got1["version"] == 1 and (got1["bucket_start"], got1["bucket_end"]) == (0, 4000)
+          and got3["status"] == "draft", (got1, got3))
+
+    req("POST", f"/experiments/{j2['id']}/end")
+    s, r = reshuffle([{"experiment_id": j2["id"], "expected_version": 1,
+                       "bucket_start": 4000, "bucket_end": 7000}])
+    check("reshuffle: ended experiment -> 409", s == 409, r)
+
+    # ---- batch reshuffle: swap active ranges + release draft ---------------
+    old_user, old_r = find_user(l5, 0, 4000, {}, "old")
+    check("old user assigned to J1 v1",
+          old_r["experiment_id"] == j1["id"] and old_r["experiment_version"] == 1, old_r)
+    old_asg = old_r["assignment_id"]
+
+    s, r = reshuffle([
+        # J1 moves into the range J2 freed when it ended
+        {"experiment_id": j1["id"], "expected_version": 1,
+         "bucket_start": 4000, "bucket_end": 7000},
+        # draft J3 released by the batch, first version = 1
+        {"experiment_id": j3["id"], "expected_version": 0,
+         "bucket_start": 7000, "bucket_end": 10000},
+    ])
+    check("reshuffle: swap + draft release succeeds", s == 200, r)
+    res = {x["id"]: x for x in r["results"]}
+    check("J1 v2 moved, changed=true",
+          res[j1["id"]]["version"] == 2
+          and (res[j1["id"]]["bucket_start"], res[j1["id"]]["bucket_end"]) == (4000, 7000)
+          and res[j1["id"]]["changed"] is True, res[j1["id"]])
+    check("draft J3 becomes active v1",
+          res[j3["id"]]["status"] == "active" and res[j3["id"]]["version"] == 1
+          and res[j3["id"]]["changed"] is True, res[j3["id"]])
+
+    s, r = assign(l5, old_user)
+    check("old user keeps original assignment + v1 snapshot after reshuffle",
+          r["assignment_id"] == old_asg and r["experiment_version"] == 1
+          and (r["snapshot"]["bucket_start"], r["snapshot"]["bucket_end"]) == (0, 4000), r)
+
+    _, new_r = find_user(l5, 4000, 7000, {}, "new")
+    check("new user routed by new layout (J1 v2)",
+          new_r["experiment_id"] == j1["id"] and new_r["experiment_version"] == 2
+          and 4000 <= new_r["bucket"] < 7000, new_r)
+    _, c_r = find_user(l5, 7000, 10000, {}, "newc")
+    check("new user reaches released draft J3", c_r["experiment_id"] == j3["id"], c_r)
+
+    s, r = reshuffle([{"experiment_id": j1["id"], "expected_version": 2,
+                       "bucket_start": 4000, "bucket_end": 7000}])
+    check("reshuffle no-op: version unchanged, changed=false",
+          s == 200 and r["results"][0]["version"] == 2
+          and r["results"][0]["changed"] is False, r)
+
+    # ---- concurrency: competing reshuffles, exactly one wins ---------------
+    layer6 = make_layer("race-reshuffle")
+    l6 = layer6["id"]
+    k1 = make_experiment(l6, "K1", 0, 5000, groups=[{"name": "all", "weight": 10000}])
+    k2 = make_experiment(l6, "K2", 5000, 10000, groups=[{"name": "all", "weight": 10000}])
+    req("POST", f"/experiments/{k1['id']}/publish")
+    req("POST", f"/experiments/{k2['id']}/publish")
+    plan_a = [{"experiment_id": k1["id"], "expected_version": 1,
+               "bucket_start": 0, "bucket_end": 3000},
+              {"experiment_id": k2["id"], "expected_version": 1,
+               "bucket_start": 3000, "bucket_end": 10000}]
+    plan_b = [{"experiment_id": k1["id"], "expected_version": 1,
+               "bucket_start": 0, "bucket_end": 7000},
+              {"experiment_id": k2["id"], "expected_version": 1,
+               "bucket_start": 7000, "bucket_end": 10000}]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        rr = list(ex.map(lambda plan: reshuffle(plan, layer=l6), [plan_a, plan_b]))
+    codes = sorted(s for s, _ in rr)
+    check("concurrent reshuffles: exactly one wins (stale loser -> 409)",
+          codes == [200, 409], rr)
+    s, rows = req("GET", f"/layers/{l6}/experiments")
+    active = sorted((e["bucket_start"], e["bucket_end"]) for e in rows if e["status"] == "active")
+    check("committed layout still partitions the layer without overlap",
+          active == [(0, 3000), (3000, 10000)] or active == [(0, 7000), (7000, 10000)], active)
+
+    # ---- concurrency: reshuffle vs assign never lands out of range ----------
+    layer7 = make_layer("race-reshuffle-assign")
+    l7 = layer7["id"]
+    m1 = make_experiment(l7, "M1", 0, 5000, groups=[{"name": "all", "weight": 10000}])
+    m2 = make_experiment(l7, "M2", 5000, 10000, groups=[{"name": "all", "weight": 10000}])
+    req("POST", f"/experiments/{m1['id']}/publish")
+    req("POST", f"/experiments/{m2['id']}/publish")
+    move = [{"experiment_id": m1["id"], "expected_version": 1,
+             "bucket_start": 5000, "bucket_end": 10000},
+            {"experiment_id": m2["id"], "expected_version": 1,
+             "bucket_start": 0, "bucket_end": 5000}]
+    ok_swap = True
+    detail = ""
+    for round_no in range(5):
+        users = [f"swap-{round_no}-{uuid.uuid4().hex[:8]}-{i}" for i in range(20)]
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            assign_futs = [ex.submit(assign, l7, u) for u in users]
+            swap_futs = [ex.submit(reshuffle, move, l7) for _ in range(2)]
+            swap_results = [f.result() for f in swap_futs]
+            [f.result() for f in assign_futs]
+        # re-arm expected versions for another round (winner bumps, loser 409s)
+        for sid, body in swap_results:
+            if sid == 200:
+                for item, got in zip(move, body["results"]):
+                    item["expected_version"] = got["version"]
+        for u in users:
+            s, rows = req("GET", f"/layers/{l7}/assignments?user_key={u}")
+            for a in rows:
+                exp = req("GET", f"/experiments/{a['experiment_id']}")[1]
+                snap = (a["snapshot"]["bucket_start"], a["snapshot"]["bucket_end"])
+                # Every assignment is always valid against its own stored
+                # snapshot (old users keep their pre-switch allocation)...
+                if not (snap[0] <= a["bucket"] < snap[1]):
+                    ok_swap = False
+                    detail = f"user {u}: bucket {a['bucket']} outside its snapshot {snap}"
+                # ...and a NEW assignment at the experiment's current version
+                # must lie inside the post-switch range.
+                if a["experiment_version"] == exp["version"] and not (
+                    exp["bucket_start"] <= a["bucket"] < exp["bucket_end"]
+                ):
+                    ok_swap = False
+                    detail = (f"user {u}: post-switch assignment v{a['experiment_version']} "
+                              f"bucket {a['bucket']} outside current "
+                              f"{exp['bucket_start']}-{exp['bucket_end']}")
+        if not ok_swap:
+            break
+    check("reshuffle-vs-assign race: no assignment outside current range", ok_swap, detail)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

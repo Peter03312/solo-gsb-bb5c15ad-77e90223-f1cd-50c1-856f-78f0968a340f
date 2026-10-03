@@ -82,6 +82,65 @@ class ExperimentOut(BaseModel):
     ended_at: datetime | None
 
 
+# ---------- batch bucket reshuffle (one mutex layer, many experiments) ----
+
+class ReshuffleItem(BaseModel):
+    """One experiment's target layout in the batch.
+
+    expected_version must equal the experiment's current version
+    (0 for a never-published draft); optimistic concurrency control so the
+    batch fails if the experiment changed after the client read it.
+    """
+
+    experiment_id: UUID
+    expected_version: int = Field(ge=0)
+    bucket_start: int = Field(ge=0, lt=TOTAL_BUCKETS)
+    bucket_end: int = Field(gt=0, le=TOTAL_BUCKETS)
+
+    @model_validator(mode="after")
+    def _validate_half_open(self) -> "ReshuffleItem":
+        if self.bucket_start >= self.bucket_end:
+            raise ValueError("bucket_start must be < bucket_end (half-open range)")
+        return self
+
+
+class BatchReshuffleIn(BaseModel):
+    layer_id: UUID
+    items: list[ReshuffleItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_experiments(self) -> "BatchReshuffleIn":
+        ids = [item.experiment_id for item in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("experiments must not be repeated in the same batch")
+        return self
+
+
+class ReshuffleResultItem(BaseModel):
+    """Post-commit experiment state; `changed` marks real version bumps."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    layer_id: UUID
+    name: str
+    status: str
+    version: int
+    bucket_start: int
+    bucket_end: int
+    conditions: dict[str, Any]
+    groups: list[GroupSpec]
+    changed: bool
+    created_at: datetime
+    published_at: datetime | None
+    ended_at: datetime | None
+
+
+class BatchReshuffleOut(BaseModel):
+    layer_id: UUID
+    results: list[ReshuffleResultItem]
+
+
 # ---------- assignment ----------
 
 class AssignIn(BaseModel):
